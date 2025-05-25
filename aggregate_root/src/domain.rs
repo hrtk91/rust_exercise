@@ -24,8 +24,12 @@ pub mod infra_ifs {
     pub trait UserAggregateRepository {
         fn find_user_by_id(
             &mut self,
-            id: i32,
+            id: i64,
         ) -> impl Future<Output = anyhow::Result<Vec<super::entities::UserAggregateRoot>>>;
-        fn create_user(&mut self, name: String) -> impl Future<Output = anyhow::Result<i64>>;
+        fn create_user(
+            &mut self,
+            user_name: String,
+            department_name: Option<String>,
+        ) -> impl Future<Output = anyhow::Result<i64>>;
     }
 }
