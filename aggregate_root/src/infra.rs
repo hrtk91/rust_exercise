@@ -1,6 +1,6 @@
-use std::{marker::PhantomData, sync::LazyLock};
+use std::sync::LazyLock;
 
-use sqlx::{Acquire, Executor, Pool, SqlitePool};
+use sqlx::{Acquire, Pool, SqlitePool};
 
 use crate::domain::{self, entities::UserAggregateRoot, infra_ifs};
 
@@ -121,7 +121,7 @@ impl infra_ifs::UserAggregateRepository for UserAggregateRepository {
             .execute(&mut *conn)
             .await?;
 
-        if let Some(_) = sqlx::query!(
+        if sqlx::query!(
             r#"
                 select id from users where users.name == $1
             "#,
@@ -129,13 +129,14 @@ impl infra_ifs::UserAggregateRepository for UserAggregateRepository {
         )
         .fetch_optional(&mut *conn)
         .await?
+        .is_some()
         {
             // 重複エラー
             return Err(anyhow::anyhow!("400"));
         }
 
         if let Some(department_name) = department_name.clone() {
-            if let Some(_) = sqlx::query!(
+            if sqlx::query!(
                 r#"
                     select id from departments where departments.name == $1
                 "#,
@@ -143,6 +144,7 @@ impl infra_ifs::UserAggregateRepository for UserAggregateRepository {
             )
             .fetch_optional(&mut *conn)
             .await?
+            .is_some()
             {
                 // 重複エラー
                 return Err(anyhow::anyhow!("400"));
