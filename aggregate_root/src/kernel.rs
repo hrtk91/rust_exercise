@@ -18,7 +18,7 @@ pub mod entities {
     }
 }
 
-pub mod infra_ifs {
+pub mod interfaces {
     use std::future::Future;
 
     pub trait UserAggregateRepository {

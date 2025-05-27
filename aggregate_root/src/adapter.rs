@@ -1,127 +1,185 @@
-mod handlers {
-    pub mod dtos {
-        use serde::Deserialize;
+use std::sync::LazyLock;
 
-        pub mod queries {
-            use serde::Serialize;
+use sqlx::{Acquire, Pool, SqlitePool};
 
-            #[derive(Debug, Clone, PartialEq, Serialize)]
-            pub struct FetchUserByIdQuery {
-                pub user_id: i64,
-            }
-        }
+use crate::kernel::{self, entities::UserAggregateRoot, interfaces};
 
-        pub mod commands {
-            use serde::Serialize;
-
-            #[derive(Debug, Clone, PartialEq, Serialize)]
-            pub struct CreateUser {
-                pub user_name: String,
-                pub department_name: Option<String>,
-            }
-        }
-
-        #[derive(Debug, Clone, PartialEq, Deserialize)]
-        pub struct User {
-            pub id: i64,
-            pub name: String,
-            pub updated_datetime: chrono::NaiveDateTime,
-            pub created_datetime: chrono::NaiveDateTime,
-            pub departments: Vec<Department>,
-        }
-
-        #[derive(Debug, Clone, PartialEq, Deserialize)]
-        pub struct Department {
-            pub id: i64,
-            pub user_id: i64,
-            pub name: String,
-            pub updated_datetime: chrono::NaiveDateTime,
-            pub created_datetime: chrono::NaiveDateTime,
-        }
-    }
-
-    use crate::domain::infra_ifs::{self};
-
-    pub async fn fetch_user_by_id(
-        mut repo: impl infra_ifs::UserAggregateRepository,
-        payload: dtos::queries::FetchUserByIdQuery,
-    ) -> anyhow::Result<Vec<dtos::User>> {
-        let result = repo.find_user_by_id(payload.user_id).await?;
-
-        Ok(result
-            .iter()
-            .map(|x| dtos::User {
-                id: x.id,
-                name: x.name.clone(),
-                departments: x
-                    .departments
-                    .iter()
-                    .map(|x| dtos::Department {
-                        id: x.id,
-                        name: x.name.clone(),
-                        user_id: x.user_id,
-                        updated_datetime: x.updated_datetime,
-                        created_datetime: x.created_datetime,
-                    })
-                    .collect(),
-                updated_datetime: x.updated_datetime,
-                created_datetime: x.created_datetime,
-            })
-            .collect())
-    }
-
-    pub async fn create_user(
-        mut repo: impl infra_ifs::UserAggregateRepository,
-        payload: dtos::commands::CreateUser,
-    ) -> anyhow::Result<i64> {
-        let id = repo
-            .create_user(payload.user_name, payload.department_name)
-            .await?;
-        Ok(id)
-    }
-
-    #[cfg(test)]
-    #[tokio::test]
-    async fn test() {
-        use std::str::FromStr;
-
-        use crate::domain::infra_ifs::UserAggregateRepository;
-        use sqlx::{sqlite::SqliteConnectOptions, SqlitePool};
-
-        // arrange
-        let pool = SqlitePool::connect_with(
-            SqliteConnectOptions::from_str("sqlite::memory:?cache=shared")
-                .expect("DBオープンに失敗しました")
-                .in_memory(true),
+pub static POOL: LazyLock<SqlitePool> = LazyLock::new(|| {
+    sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(5)
+        .connect_lazy(
+            &std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite::memory:".to_string()),
         )
-        .await
-        .expect("テストDB作成に失敗しました");
+        .expect("Failed to create database connection pool")
+});
+
+#[derive(Debug, Clone, PartialEq)]
+struct FetchUserByIdRow {
+    pub user_id: Option<i64>,
+    pub user_name: String,
+    pub user_updated_datetime: chrono::NaiveDateTime,
+    pub user_created_datetime: chrono::NaiveDateTime,
+    pub department_id: Option<i64>,
+    pub department_name: Option<String>,
+    pub department_updated_datetime: Option<chrono::NaiveDateTime>,
+    pub department_created_datetime: Option<chrono::NaiveDateTime>,
+}
+
+/// # sqlxメモ
+/// ## Acquire
+/// Executorを取得するためのacquire()メソッドのtrait  
+/// Pool, PoolConnection等に実装されている
+/// 所有権を取得するため、構造体に持ちまわす用途には使えない
+/// そのため、UserAggregateRepositoryはPool<DB>のstruct自体を保持するようにした(DB可搬性を諦め)
+/// ## Executor
+/// クエリを実行するためのexecuteメソッドを備えるtrait
+/// Transaction,Connection等に実装されている
+pub struct UserAggregateRepository(pub Pool<sqlx::sqlite::Sqlite>);
+impl UserAggregateRepository {
+    pub fn new(pool: Pool<sqlx::sqlite::Sqlite>) -> Self {
+        UserAggregateRepository(pool)
+    }
+}
+impl interfaces::UserAggregateRepository for UserAggregateRepository {
+    async fn find_user_by_id(&mut self, id: i64) -> anyhow::Result<Vec<UserAggregateRoot>> {
+        let mut conn = self.0.acquire().await?;
+        let rows = sqlx::query_as!(
+            FetchUserByIdRow,
+            r#"
+                SELECT
+                    users.id AS user_id,
+                    users.name AS user_name,
+                    users.updated_datetime AS user_updated_datetime,
+                    users.created_datetime AS user_created_datetime,
+                    departments.id AS department_id,
+                    departments.name AS department_name,
+                    departments.updated_datetime AS department_updated_datetime,
+                    departments.created_datetime AS department_created_datetime
+                FROM users
+                LEFT JOIN departments ON users.id = departments.user_id
+                WHERE user_id = $1
+            "#,
+            id
+        )
+        .fetch_all(&mut *conn)
+        .await?;
+
+        let rows = rows
+            .into_iter()
+            .fold(vec![], |mut acc: Vec<UserAggregateRoot>, row| {
+                if let Some(user) = acc.iter_mut().find(|user| user.id == row.user_id.unwrap()) {
+                    if let Some(department_id) = row.department_id {
+                        user.departments.push(kernel::entities::Department {
+                            id: department_id,
+                            user_id: row.user_id.unwrap(),
+                            name: row.department_name.unwrap_or_default(),
+                            updated_datetime: row.department_updated_datetime.unwrap_or_default(),
+                            created_datetime: row.department_created_datetime.unwrap_or_default(),
+                        });
+                    }
+                } else {
+                    let new_user = UserAggregateRoot {
+                        id: row.user_id.unwrap(),
+                        name: row.user_name,
+                        updated_datetime: row.user_updated_datetime,
+                        created_datetime: row.user_created_datetime,
+                        departments: if let Some(department_id) = row.department_id {
+                            vec![kernel::entities::Department {
+                                id: department_id,
+                                user_id: row.user_id.unwrap_or_default(),
+                                name: row.department_name.unwrap_or_default(),
+                                updated_datetime: row
+                                    .department_updated_datetime
+                                    .unwrap_or_default(),
+                                created_datetime: row
+                                    .department_created_datetime
+                                    .unwrap_or_default(),
+                            }]
+                        } else {
+                            vec![]
+                        },
+                    };
+                    acc.push(new_user);
+                }
+
+                acc
+            });
+
+        Ok(rows)
+    }
+
+    async fn create_user(
+        &mut self,
+        user_name: String,
+        department_name: Option<String>,
+    ) -> anyhow::Result<i64> {
+        let mut conn = self.0.acquire().await?;
+        let created_datetime = chrono::Utc::now().naive_utc();
+        let updated_datetime = created_datetime;
+
+        sqlx::query!(r#"pragma foreign_keys = ON;"#)
+            .execute(&mut *conn)
+            .await?;
+
+        if sqlx::query!(
+            r#"
+                select id from users where users.name == $1
+            "#,
+            user_name
+        )
+        .fetch_optional(&mut *conn)
+        .await?
+        .is_some()
         {
-            let mut conn = pool
-                .acquire()
-                .await
-                .expect("arrange:コネクション取得に失敗");
-            sqlx::migrate!()
-                .run(&mut *conn)
-                .await
-                .expect("DB初期化に失敗しました");
+            // 重複エラー
+            return Err(anyhow::anyhow!("400"));
         }
-        let mut repo = crate::infra::UserAggregateRepository(pool);
 
-        let id = repo
-            .create_user("user1".into(), Some("dep1".into()))
-            .await
-            .expect("ユーザー作成失敗");
+        if let Some(department_name) = department_name.clone() {
+            if sqlx::query!(
+                r#"
+                    select id from departments where departments.name == $1
+                "#,
+                department_name
+            )
+            .fetch_optional(&mut *conn)
+            .await?
+            .is_some()
+            {
+                // 重複エラー
+                return Err(anyhow::anyhow!("400"));
+            }
+        }
 
-        match fetch_user_by_id(repo, dtos::queries::FetchUserByIdQuery { user_id: id }).await {
-            Ok(values) => {
-                assert_eq!(1, values.len());
-                assert_eq!(1, values[0].id);
-                assert_eq!("user1", values[0].name.as_str());
-            }
-            Err(_) => {
-                assert!(false)
-            }
-        };
+        let mut tx = conn.begin().await?;
+        let user_id = sqlx::query!(
+            r#"
+                INSERT INTO users (name, updated_datetime, created_datetime)
+                VALUES ($1, $2, $3)
+            "#,
+            user_name,
+            updated_datetime,
+            created_datetime,
+        )
+        .execute(&mut *tx)
+        .await?
+        .last_insert_rowid();
+
+        sqlx::query!(
+            r#"
+                insert into departments (user_id, name, updated_datetime, created_datetime)
+                values ($1, $2, $3, $4)
+            "#,
+            user_id,
+            department_name,
+            updated_datetime,
+            created_datetime
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+
+        Ok(user_id)
     }
 }
